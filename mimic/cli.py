@@ -1,23 +1,24 @@
-"""mimic CLI — capture any iOS app, generate a client.
+"""mimic CLI — capture apps, generate clients, and run a sandboxed code agent."""
+from __future__ import annotations
 
-    mimic record            start the proxy + print iPhone setup steps
-    mimic hosts             list captured hosts (pick your API host here)
-    mimic learn <host>      show the endpoints mimic saw for a host
-    mimic gen <host>        AI-write a Python client for a host
-    mimic unpin <ipa|id>    defeat cert pinning (Frida) so capture works
-    mimic doctor            check your setup
-"""
 import argparse
+import os
 import re
 import shutil
 import socket
 import subprocess
 import sys
 
-from . import codegen
-from . import unpin
-from .sources import har
-from .sources import mitm
+from . import agent, codegen, unpin
+from .sources import har, mitm
+
+
+def _openai_sdk_ready():
+    try:
+        from openai import OpenAI  # noqa: F401
+    except (ImportError, AttributeError):
+        return False
+    return True
 
 
 def _mitm_and_flows():
@@ -26,14 +27,12 @@ def _mitm_and_flows():
 
 
 def _flows_from_args(args):
-    """Flows from a HAR file when --har is given, else from live mitmweb."""
     if getattr(args, "har", None):
         return None, har.load(args.har)
     return _mitm_and_flows()
 
 
 def _endpoints_from_args(args, m, flows):
-    """Endpoints for a host, from HAR (inline bodies) or mitmweb (fetched)."""
     if getattr(args, "har", None):
         return har.endpoints(args.har, args.host)
     return mitm.endpoints(m, flows, args.host)
@@ -51,7 +50,6 @@ def _lan_ip():
 
 
 def _mitmweb_cmd():
-    """Prefer mitmweb on PATH; otherwise run it ephemerally through uv."""
     if shutil.which("mitmweb"):
         return ["mitmweb"]
     if shutil.which("uvx"):
@@ -61,80 +59,24 @@ def _mitmweb_cmd():
 
 def cmd_record(args):
     ip = _lan_ip()
-    print(
-        f"""
-iPhone capture — do this once, then just reopen the app to add traffic:
-
-  1. iPhone → Settings → Wi-Fi → (your network) ⓘ → Configure Proxy → Manual
-        Server: {ip}      Port: 8080
-  2. Safari → http://mitm.it → download the Apple (.pem) profile
-  3. Settings → General → VPN & Device Management → install the profile
-  4. Settings → General → About → Certificate Trust Settings
-        → turn ON full trust for "mitmproxy"          ← everyone forgets this
-  5. open the target app and use it normally
-  6. back here:   mimic hosts      then   mimic gen <api-host>
-
-  mitmweb dashboard: http://127.0.0.1:8081   (mimic reads flows from here)
-
-  Some apps (banks, Instagram) pin their certificate, so a proxy sees no
-  usable traffic — those aren't supported. Many apps aren't pinned and just
-  work; if `mimic hosts` shows the app's API host, you're good.
-"""
-    )
+    print(f"iPhone proxy: {ip}:8080\nInstall/trust the mitmproxy profile, use the app, then run `mimic hosts`.")
     cmd = _mitmweb_cmd()
     if not cmd:
-        sys.exit(
-            "no proxy available — install uv (https://astral.sh/uv) so mimic can\n"
-            "run mitmproxy for you, or `pipx install mitmproxy` yourself."
-        )
-    sys.stdout.flush()  # show the steps before the proxy takes over the terminal
-    try:
-        subprocess.run(cmd)
-    except FileNotFoundError:
-        sys.exit("failed to launch mitmweb")
+        sys.exit("no proxy launcher found — install uv or mitmproxy")
+    subprocess.run(cmd, check=False)
 
 
 def cmd_doctor(args):
     ok = True
-
-    def check(name, present, fix):
+    def required(name, present, fix):
         nonlocal ok
-        mark = "ok " if present else "MISSING"
-        print(f"  [{mark}] {name}")
+        print(f"  [{'ok ' if present else 'MISSING'}] {name}")
         if not present:
             ok = False
-            print(f"          → {fix}")
-
-    print("mimic setup check:\n")
-    check("proxy (mitmweb or uvx)", _mitmweb_cmd() is not None,
-          "install uv: curl -LsSf https://astral.sh/uv/install.sh | sh")
-    check("AI generator (claude or opencode)",
-          shutil.which("claude") is not None or shutil.which("opencode") is not None,
-          "install Claude Code or OpenCode (https://opencode.ai), or use `mimic gen --prompt-only`")
-    reachable = False
-    try:
-        mitm.Mitm().flows()
-        reachable = True
-    except mitm.MitmError:
-        pass
-    check("mitmweb running + reachable", reachable,
-          "run `mimic record` in another terminal")
-
-    def opt(name, present, fix):
-        # Optional — only needed for `mimic unpin`; never fails the check.
-        print(f"  [{'ok ' if present else '  -'}] {name}")
-        if not present:
-            print(f"          → {fix}")
-
-    print("\noptional — only for `mimic unpin` (pinned apps):")
-    opt("git (fetch unpinning scripts)", shutil.which("git") is not None,
-        "install git (Xcode CLT: xcode-select --install)")
-    opt("frida (run the hooks)", shutil.which("frida") is not None,
-        "pipx install frida-tools   (or: uv tool install frida-tools)")
-    opt("objection (gadget inject, no-JB path)", shutil.which("objection") is not None,
-        "pipx install objection   (or: uv tool install objection)")
-
-    print(f"\nLAN IP for the iPhone proxy: {_lan_ip()}:8080")
+            print(f"       -> {fix}")
+    required("OpenAI SDK", _openai_sdk_ready(), "reinstall mimic-client")
+    required("OPENAI_API_KEY", bool(os.environ.get("OPENAI_API_KEY", "").strip()), "export OPENAI_API_KEY=...")
+    print(f"  [{'ok ' if _mitmweb_cmd() else '  -'}] proxy launcher (optional with HAR)")
     sys.exit(0 if ok else 1)
 
 
@@ -142,13 +84,9 @@ def cmd_hosts(args):
     _, flows = _flows_from_args(args)
     rows = mitm.hosts(flows)
     if not rows:
-        if getattr(args, "har", None):
-            sys.exit("no entries in the HAR file")
-        sys.exit("no traffic captured yet — run `mimic record` and use the app")
-    print(f"{'requests':>9}  host")
+        sys.exit("no traffic found")
     for host, n in rows:
         print(f"{n:>9}  {host}")
-    print("\nPick your API host (usually the one with JSON, not media/cdn).")
 
 
 def cmd_learn(args):
@@ -156,9 +94,8 @@ def cmd_learn(args):
     eps = _endpoints_from_args(args, m, flows)
     if not eps:
         sys.exit(f"no requests to {args.host} found")
-    print(f"{args.host}: {len(eps)} endpoints\n")
     for e in eps:
-        print(f"  {e['method']:5s} {e['path']}   -> {e['status']}")
+        print(f"{e['method']:5s} {e['path']} -> {e['status']}")
 
 
 def cmd_gen(args):
@@ -166,21 +103,38 @@ def cmd_gen(args):
     eps = _endpoints_from_args(args, m, flows)
     if not eps:
         sys.exit(f"no requests to {args.host} found")
-
     if args.prompt_only:
         print(codegen.build_prompt(args.host, eps))
         return
-
     out = args.out or _default_out(args.host)
-    print(f"asking {args.generator} to write a client from {len(eps)} endpoints…", file=sys.stderr)
-    source = codegen.generate(args.host, eps, model=args.model, generator=args.generator)
-    with open(out, "w") as f:
+    try:
+        source = codegen.generate(args.host, eps, model=args.model)
+    except RuntimeError as exc:
+        sys.exit(str(exc))
+    with open(out, "w", encoding="utf-8") as f:
         f.write(source)
     cls = _class_name(source)
-    print(f"\nwrote {out}")
-    print(f"\n    from {out[:-3]} import {cls or 'Client'}")
-    print(f"    acc = {cls or 'Client'}()")
-    print("    # then call the generated methods\n")
+    module = os.path.splitext(os.path.basename(out))[0]
+    print(f"wrote {out}\nfrom {module} import {cls or 'Client'}")
+
+
+def cmd_agent(args):
+    try:
+        result = agent.run_agent(
+            args.task,
+            path=args.path,
+            model=args.model,
+            container_size=args.container_size,
+            out_dir=args.out_dir,
+            apply=args.apply,
+        )
+    except (RuntimeError, ValueError) as exc:
+        sys.exit(str(exc))
+    if result.output_text.strip():
+        print(result.output_text.strip())
+    print(f"report: {result.report_path}\npatch: {result.patch_path}\nworkspace: {result.workspace_zip_path}")
+    if args.apply:
+        print(f"applied: {'yes' if result.patch_applied else 'no changes'}")
 
 
 def _default_out(host):
@@ -194,37 +148,44 @@ def _class_name(source):
 
 
 def main(argv=None):
-    p = argparse.ArgumentParser(prog="mimic", description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser(prog="mimic", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
 
-    sub.add_parser("record", help="start the proxy + iPhone setup steps").set_defaults(func=cmd_record)
-    sub.add_parser("doctor", help="check your setup").set_defaults(func=cmd_doctor)
-    hp = sub.add_parser("hosts", help="list captured hosts")
-    hp.add_argument("--har", metavar="FILE", help="read from a HAR file instead of mitmweb")
+    sub.add_parser("record").set_defaults(func=cmd_record)
+    sub.add_parser("doctor").set_defaults(func=cmd_doctor)
+
+    hp = sub.add_parser("hosts")
+    hp.add_argument("--har")
     hp.set_defaults(func=cmd_hosts)
 
-    lp = sub.add_parser("learn", help="show endpoints for a host")
+    lp = sub.add_parser("learn")
     lp.add_argument("host")
-    lp.add_argument("--har", metavar="FILE", help="read from a HAR file instead of mitmweb")
+    lp.add_argument("--har")
     lp.set_defaults(func=cmd_learn)
 
-    gp = sub.add_parser("gen", help="AI-generate a client for a host")
+    gp = sub.add_parser("gen")
     gp.add_argument("host")
-    gp.add_argument("-o", "--out", help="output .py path")
-    gp.add_argument("--model", default="sonnet", help="model name (claude default: sonnet)")
-    gp.add_argument("--generator", default="claude", choices=["claude", "opencode"],
-                    help="AI generator to use (default: claude)")
-    gp.add_argument("--prompt-only", action="store_true", help="print the prompt instead of calling the AI generator")
-    gp.add_argument("--har", metavar="FILE", help="read from a HAR file instead of mitmweb")
+    gp.add_argument("-o", "--out")
+    gp.add_argument("--model", default=codegen.DEFAULT_MODEL)
+    gp.add_argument("--prompt-only", action="store_true")
+    gp.add_argument("--har")
     gp.set_defaults(func=cmd_gen)
 
-    up = sub.add_parser("unpin", help="defeat cert pinning via Frida so capture works")
-    up.add_argument("target", help="a decrypted .ipa (gadget path) or app bundle-id (jailbroken path)")
-    up.add_argument("--ca", help="mitmproxy CA cert (default: ~/.mitmproxy/mitmproxy-ca-cert.pem)")
-    up.add_argument("--proxy-host", help="proxy host to bake in (default: this Mac's LAN IP)")
-    up.add_argument("--workdir", help="where to put scripts + patched IPA (default: mimic-unpin/)")
-    up.add_argument("--codesign", help="signing identity for `objection patchipa`")
+    ap = sub.add_parser("agent", help="run a software task in an OpenAI-hosted sandbox")
+    ap.add_argument("task")
+    ap.add_argument("--path", default=".")
+    ap.add_argument("--model", default=agent.DEFAULT_MODEL)
+    ap.add_argument("--container-size", choices=["small", "medium", "large"], default=agent.DEFAULT_CONTAINER_SIZE)
+    ap.add_argument("--out-dir", default=".mimic-agent")
+    ap.add_argument("--apply", action="store_true")
+    ap.set_defaults(func=cmd_agent)
+
+    up = sub.add_parser("unpin")
+    up.add_argument("target")
+    up.add_argument("--ca")
+    up.add_argument("--proxy-host")
+    up.add_argument("--workdir")
+    up.add_argument("--codesign")
     up.set_defaults(func=unpin.cmd_unpin)
 
     args = p.parse_args(argv)
