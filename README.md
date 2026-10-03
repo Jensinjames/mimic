@@ -1,6 +1,6 @@
 # mimic
 
-Intercept any app, then call it from Python like a library.
+Intercept an app you are authorized to inspect, learn its API shape, then call it from Python like a library. Client generation now uses OpenAI rather than a local Claude CLI, and `mimic agent` can perform software-engineering work in an isolated OpenAI-hosted sandbox.
 
 ```python
 from hinge_client import Hinge
@@ -10,117 +10,123 @@ recs = acc.get_recommendations()
 acc.like(subject_id, comment="hi lol")
 ```
 
-You don't write `hinge_client.py`. mimic captures your own app traffic and an AI
-generates the client from it.
+## Architecture
 
-## How it works
+```text
+capture traffic -> extract session -> redact samples -> OpenAI Responses API -> generated client
 
-Most apps authenticate every request with the same bundle of values: a bearer
-token, some device ids, a session id, cookies. They're stable across calls.
-Capture them once from a real request you made, and you can replay them on new
-requests to the same API.
-
-```
-capture traffic   ->   extract auth   ->   generate client
-  (mitmproxy)         (mimic.Session)      (claude reads the
-                                            captured endpoints)
+local source -> filtered archive -> OpenAI-hosted sandbox -> report + patch + workspace
+                                    (network disabled)
 ```
 
-The generated client is plain Python on top of `mimic.App`, and you edit it like
-any other file. It gives you named methods, body templates, and the multi-step
-call chaining mobile APIs tend to need (fetch a token in one call, spend it in
-the next).
+Generated clients remain ordinary Python built on `mimic.App`.
 
 ## Install
 
+Requires Python 3.10+.
+
 ```bash
 sh install.sh
+export OPENAI_API_KEY="..."
+mimic doctor
 ```
 
-Installs [`uv`](https://astral.sh/uv) if you don't have it, then mimic in an
-isolated tool env. mitmproxy isn't a separate install; mimic launches it via
-`uvx` on first `record`. (Manual: `uv tool install mimic-client`.)
+`OPENAI_API_KEY` is used by both `mimic gen` and `mimic agent`. Override the defaults with `MIMIC_OPENAI_MODEL` and `MIMIC_AGENT_MODEL`.
+
+## Capture and generate
 
 ```bash
-mimic doctor                    # confirm proxy + claude are ready
+mimic record
+mimic hosts
+mimic learn prod-api.example.com
+mimic gen prod-api.example.com
 ```
 
-## Use it (iPhone)
+For a HAR file:
 
 ```bash
-mimic record                    # starts the proxy, prints the iPhone steps
+mimic hosts --har traffic.har
+mimic learn api.example.com --har traffic.har
+mimic gen api.example.com --har traffic.har
 ```
 
-`record` fills in your Mac's LAN IP and walks you through it:
-
-1. iPhone -> Wi-Fi -> Configure Proxy -> Manual -> `<your-mac-ip>:8080`
-2. Safari -> `http://mitm.it` -> install the Apple profile
-3. Settings -> General -> About -> Certificate Trust Settings -> turn on full
-   trust for mitmproxy. This step is easy to miss and nothing works without it.
-4. open the app, use it normally
-
-Then:
+Audit the redacted prompt without making a model request:
 
 ```bash
-mimic hosts                     # list captured hosts; pick your API host
-mimic learn  prod-api.hingeaws.net    # see the endpoints mimic saw
-mimic gen    prod-api.hingeaws.net    # generate hinge_client.py
+mimic gen api.example.com --har traffic.har --prompt-only
 ```
 
-Then `from hinge_client import Hinge; Hinge().get_recommendations()`.
+`mimic gen` uses the OpenAI Responses API with `store=False`. Common credential-shaped fields in query strings and request/response samples are redacted before generation. Redaction is defense in depth; use `--prompt-only` when you need to inspect exactly what will be sent.
+
+## mimic-agent sandbox
+
+Use `mimic agent` for deconstruction, reconstruction, adaptation, refactoring, debugging, and test-driven code changes:
+
+```bash
+mimic agent "audit client generation, reproduce failures, fix them, and add regression tests"
+```
+
+By default it:
+
+- filters `.git`, environments, dependency/build caches, `.env*`, common key/certificate files, common credential files, symlinks, and oversized files;
+- uploads the filtered project to an OpenAI-hosted Linux sandbox;
+- disables sandbox network access;
+- creates a clean Git baseline inside the sandbox;
+- asks the agent to inspect, edit, and test the software;
+- downloads a report, Git patch, and reconstructed workspace into `.mimic-agent/`;
+- does **not** modify your local project.
+
+Artifacts:
+
+```text
+.mimic-agent/mimic-agent-report.md
+.mimic-agent/mimic-agent.patch
+.mimic-agent/mimic-agent-workspace.zip
+```
+
+To apply the returned patch, the local path must be a Git working tree and the patch must pass `git apply --check`:
+
+```bash
+mimic agent "fix the failing tests" --apply
+```
+
+Other options:
+
+```bash
+mimic agent "task" --path ./some-project
+mimic agent "task" --container-size small
+mimic agent "task" --container-size large
+mimic agent "task" --model gpt-6-astra
+```
+
+The initial sandbox archive is capped at 5 MiB to stay within the hosted inline-file limit. For a large repository, point `--path` at the smallest relevant project/subtree.
 
 ## The library
-
-Three ways to build a session by hand, if you don't want codegen:
 
 ```python
 from mimic import Session
 
-Session.from_mitm("prod-api.hingeaws.net")        # pull auth from mitmweb
-Session.from_curl(open("copied.txt").read())      # paste "Copy as cURL" from devtools
-Session(base_url="https://x.com", headers={...})  # explicit
+Session.from_mitm("prod-api.example.com")
+Session.from_curl(open("copied.txt").read())
+Session.from_har("traffic.har", "api.example.com")
+Session(base_url="https://api.example.com", headers={...})
 ```
 
-`.get(path)`, `.post(path, json=...)`, and the other common HTTP verb helpers
-return parsed JSON and raise `requests.HTTPError` for failed responses. If your
-token rotates, a `401` on an idempotent request triggers one re-pull from
-mitmweb and a retry. Non-idempotent requests are not retried unless you explicitly
-pass `refresh=True`.
+`.get(path)`, `.post(path, json=...)`, and the other common HTTP helpers return parsed JSON and raise `requests.HTTPError` for failed responses. A `401` on an idempotent request can refresh captured credentials once from mitmweb.
 
-## Capture backends
+## Capture limitations
 
-- **mitmproxy** for iOS apps (the default). mimic reads its JSON flow API and
-  runs it via `uvx`, so there's nothing extra to install.
-- **cURL / paste** for anything with a web version. `Copy as cURL` in devtools,
-  then `Session.from_curl(text)`. No proxy, no cert.
-- **HAR file** for web apps and anything you can capture in a browser. In Chrome
-  or Firefox devtools, open the Network tab, right-click a request, and choose
-  "Save all as HAR". Then `mimic hosts --har traffic.har` and
-  `mimic gen api.example.com --har traffic.har`, or build a session directly with
-  `Session.from_har("traffic.har", "api.example.com")`. No proxy, no cert.
+- **Certificate pinning:** see `docs/pinning.md` and the existing `mimic unpin` flow. Use only on software/accounts you are authorized to inspect.
+- **DPoP / sender-constrained tokens:** captured requests may not be replayable; see `docs/dpop.md`.
 
-## Limitations
+## Security and operating rules
 
-Two auth schemes get in the way, for different reasons:
-
-- **Certificate pinning** (banking, Instagram). The app rejects the mitmproxy
-  cert, so the proxy sees no traffic and nothing shows up in `mimic hosts`. This
-  blocks *capture*, not replay — get past the pin and the rest works normally.
-  `mimic unpin <ipa|bundle-id>` sets up a Frida-based bypass; see
-  [docs/pinning.md](docs/pinning.md).
-- **DPoP / sender-constrained tokens.** Each request carries a fresh proof
-  signed by a private key that never leaves the device, so captured requests
-  don't replay. This defeats the core model, not just capture; there's no clean
-  workaround. See [docs/dpop.md](docs/dpop.md).
-
-If `mimic hosts` shows the app's API host, you're good.
-
-## Ethics
-
-Use it on your own accounts and data. It replays your session; it is not a tool
-for accessing anyone else's. Respect each app's terms of service.
+- Keep `OPENAI_API_KEY` in your shell or secret manager; mimic does not place it inside the hosted sandbox.
+- The engineering sandbox runs with network access disabled by default.
+- `mimic agent` never applies returned changes unless you pass `--apply`.
+- Review the report and patch before committing changes.
+- Use mimic only with accounts, applications, and data you are authorized to inspect, and follow applicable terms and law.
 
 ## License
 
-MIT, see [LICENSE](LICENSE). Provided as-is, no warranty. Use on your own
-accounts and data; you are responsible for complying with each app's terms.
+MIT, see [LICENSE](LICENSE). Provided as-is, no warranty.

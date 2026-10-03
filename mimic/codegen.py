@@ -1,36 +1,37 @@
-"""Turn captured endpoints into an ergonomic Python client, using an AI.
+"""Generate ergonomic Python clients from captured endpoints with OpenAI."""
+from __future__ import annotations
 
-`mimic gen <host>` builds a digest of what mimic saw on the wire and sends it
-to an AI generator. The AI writes a real, editable client
-class — named methods, body templates, response handling, and the multi-step
-chaining that mobile APIs often need — on top of mimic.App.
-"""
+import json
+import os
 import re
-import subprocess
-import sys
+from typing import Any
 
+DEFAULT_MODEL = os.environ.get("MIMIC_OPENAI_MODEL", "gpt-6-astra")
+MAX_DIGEST_CHARS = 250_000
+_SENSITIVE_KEY = re.compile(
+    r"(?:pass(?:word|wd)?|secret|token|api[_-]?key|authorization|cookie|session[_-]?id|refresh[_-]?token)",
+    re.I,
+)
 
 PROMPT = """\
 You are writing a Python API client. Below is real captured HTTP traffic from \
 the app `{host}`, recorded by a proxy while the user exercised the app with \
-their own account. Your job: turn it into a clean, ergonomic client library.
+their own account. Turn it into a clean, ergonomic client library.
 
 Rules:
 - Output ONE Python file, nothing else. No prose, no markdown fences.
 - Subclass `mimic.App`. Set `HOST = "{host}"`. Auth/device headers are pulled \
 automatically by the base class — do NOT hardcode tokens or headers.
 - Give methods human names for what they DO (get_posts, like, send_message), \
-not the raw path. Infer intent from the path, bodies, and status codes.
+not the raw path. Infer intent from paths, bodies, and status codes.
 - Use self.get(path)/self.post(path, json=body). Both return parsed JSON.
-- If an endpoint's body reuses an id or token that another endpoint returns \
-(e.g. a viewToken, a playerId, a session id), chain the calls: fetch the \
-prerequisite inside the method or cache it on the instance. Read the sample \
-bodies carefully to find these dependencies.
-- Turn values that vary per call (ids, text, ratings) into method parameters. \
-Keep values that are constant-for-this-user as defaults or instance state.
-- Skip pure telemetry/analytics/config endpoints unless they're needed as a \
-prerequisite for a real action.
-- Add a one-line docstring per method. Keep it tight and readable.
+- If an endpoint body reuses an id or token another endpoint returns, chain the \
+calls or cache the dependency on the instance.
+- Turn values that vary per call into method parameters. Keep stable structural \
+values as defaults or instance state.
+- Skip telemetry/analytics/config endpoints unless needed as a prerequisite.
+- Add a one-line docstring per method. Keep the code tight and readable.
+- Never reconstruct any value shown as `<redacted>`.
 
 Captured endpoints for {host}:
 
@@ -38,18 +39,60 @@ Captured endpoints for {host}:
 """
 
 
+def _redact_obj(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {
+            key: ("<redacted>" if _SENSITIVE_KEY.search(str(key)) else _redact_obj(item))
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [_redact_obj(item) for item in value]
+    return value
+
+
+def redact_text(text: str) -> str:
+    """Redact common credential fields while preserving body structure."""
+    if not text:
+        return ""
+    try:
+        parsed = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return re.sub(
+            r"(?i)(password|passwd|secret|token|api[_-]?key|authorization|cookie|"
+            r"session[_-]?id|credential|signature)"
+            r"(\s*[:=]\s*)([^&\r\n,;}]+)",
+            r"\1\2<redacted>",
+            text,
+        )
+    return json.dumps(_redact_obj(parsed), indent=2, ensure_ascii=False)
+
+
 def build_digest(endpoints):
-    """Render the endpoint list into the block the AI reads."""
+    """Render endpoint samples into a bounded, redacted block for the model."""
     parts = []
+    used = 0
     for e in endpoints:
         block = [f"### {e['method']} {e['path']}  -> {e['status']}"]
-        if e["query"]:
-            block.append(f"query: {e['query']}")
-        if e["request_body"]:
-            block.append(f"request body:\n{e['request_body']}")
-        if e["response_body"]:
-            block.append(f"response body:\n{e['response_body']}")
-        parts.append("\n".join(block))
+        if e.get("query"):
+            block.append(f"query: {redact_text(e['query'])}")
+        if e.get("request_body"):
+            block.append(f"request body:\n{redact_text(e['request_body'])}")
+        if e.get("response_body"):
+            block.append(f"response body:\n{redact_text(e['response_body'])}")
+        rendered = "\n".join(block)
+        extra = len(rendered) + 2
+        if used + extra > MAX_DIGEST_CHARS:
+            if not parts:
+                rendered = (
+                    rendered[:MAX_DIGEST_CHARS]
+                    + "\n### … endpoint body truncated to stay within the prompt budget"
+                )
+                extra = len(rendered) + 2
+            else:
+                parts.append("### … additional endpoints omitted to stay within the prompt budget")
+                break
+        parts.append(rendered)
+        used += extra
     return "\n\n".join(parts)
 
 
@@ -57,31 +100,39 @@ def build_prompt(host, endpoints):
     return PROMPT.format(host=host, digest=build_digest(endpoints))
 
 
-def generate(host, endpoints, model="sonnet", generator="claude"):
-    """Run the AI generator on the prompt and return the generated Python source."""
+def _client():
+    try:
+        from openai import OpenAI
+    except ImportError as exc:  # pragma: no cover - dependency guard
+        raise RuntimeError("OpenAI SDK is missing; reinstall mimic-client") from exc
+    return OpenAI(max_retries=3, timeout=180.0)
+
+
+def generate(host, endpoints, model=None, client=None):
+    """Generate Python source through OpenAI's Responses API."""
+    client = client or _client()
+    model = model or DEFAULT_MODEL
     prompt = build_prompt(host, endpoints)
     try:
-        if generator == "opencode":
-            proc = subprocess.run(
-                ["opencode", "run", prompt],
-                capture_output=True, text=True, timeout=300,
-            )
-        else:
-            proc = subprocess.run(
-                ["claude", "-p", "--model", model],
-                input=prompt, capture_output=True, text=True, timeout=300,
-            )
-    except FileNotFoundError:
-        sys.exit(
-            f"`{generator}` CLI not found — install it, "
-            "or use `mimic gen --prompt-only`"
+        response = client.responses.create(
+            model=model,
+            input=prompt,
+            instructions=(
+                "Return only valid Python source code. Do not include Markdown fences, "
+                "analysis, or explanations."
+            ),
+            store=False,
         )
-    if proc.returncode != 0:
-        sys.exit(f"{generator} failed:\n{proc.stderr}")
-    return _strip_fences(proc.stdout)
+    except Exception as exc:
+        raise RuntimeError(f"OpenAI generation failed: {exc}") from exc
+
+    text = getattr(response, "output_text", "") or ""
+    if not text.strip():
+        raise RuntimeError("OpenAI returned no generated source")
+    return _strip_fences(text)
 
 
 def _strip_fences(text):
-    """AI generators sometimes wrap output in ```python fences."""
-    m = re.search(r"```(?:python)?\n(.*?)```", text, re.S)
+    """Defensively remove Markdown fences if a model emits them anyway."""
+    m = re.search(r"```(?:python)?\s*\n(.*?)```", text, re.S | re.I)
     return (m.group(1) if m else text).strip() + "\n"
