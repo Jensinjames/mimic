@@ -58,8 +58,9 @@ def redact_text(text: str) -> str:
         parsed = json.loads(text)
     except (TypeError, ValueError, json.JSONDecodeError):
         return re.sub(
-            r"(?i)(password|passwd|secret|token|api[_-]?key|authorization|cookie|session[_-]?id)"
-            r"(\s*[:=]\s*)([^&\s,;}]+)",
+            r"(?i)(password|passwd|secret|token|api[_-]?key|authorization|cookie|"
+            r"session[_-]?id|credential|signature)"
+            r"(\s*[:=]\s*)([^&\r\n,;}]+)",
             r"\1\2<redacted>",
             text,
         )
@@ -80,9 +81,16 @@ def build_digest(endpoints):
             block.append(f"response body:\n{redact_text(e['response_body'])}")
         rendered = "\n".join(block)
         extra = len(rendered) + 2
-        if parts and used + extra > MAX_DIGEST_CHARS:
-            parts.append("### … additional endpoints omitted to stay within the prompt budget")
-            break
+        if used + extra > MAX_DIGEST_CHARS:
+            if not parts:
+                rendered = (
+                    rendered[:MAX_DIGEST_CHARS]
+                    + "\n### … endpoint body truncated to stay within the prompt budget"
+                )
+                extra = len(rendered) + 2
+            else:
+                parts.append("### … additional endpoints omitted to stay within the prompt budget")
+                break
         parts.append(rendered)
         used += extra
     return "\n\n".join(parts)

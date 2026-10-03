@@ -22,11 +22,12 @@ _EXCLUDED_DIRS = {
     ".aws", ".gnupg",
 }
 _EXCLUDED_NAMES = {
-    ".env", ".npmrc", ".pypirc", "id_rsa", "id_ed25519", "credentials.json",
+    ".env", ".netrc", ".npmrc", ".pypirc", "id_rsa", "id_ed25519",
+    "id_ecdsa", "id_dsa", "id_ecdsa_sk", "credentials.json",
     "service-account.json", "service_account.json",
 }
 _EXCLUDED_GLOBS = (
-    ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*credentials*.json",
+    ".env.*", "*.pem", "*.key", "*.p12", "*.pfx", "*.htpasswd", "*credentials*.json",
     "*service-account*.json", "*service_account*.json",
 )
 
